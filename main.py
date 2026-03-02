@@ -40,7 +40,7 @@ if not URL_CONDITIONS or not URL_ORDER:
 WAIT_PHOTOS, WAIT_TEXT, WAIT_PRICE, WAIT_CONFIRM = range(4)
 
 MAX_PHOTOS = 10
-INVISIBLE = "\u200b"  # zero-width space, чтобы сообщение с кнопками выглядело пустым
+INVISIBLE = "\u2060"  # zero-width space, чтобы сообщение с кнопками выглядело пустым
 
 @dataclass
 class Draft:
