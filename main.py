@@ -1,10 +1,10 @@
 import os
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
-
 import asyncpg
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta, timezone, time as dtime
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -20,35 +20,36 @@ from telegram.ext import (
     filters,
 )
 
-# ============ LOGGING ============
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("technopostbot")
 
-# ============ ENV ============
+# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # можно "@TechnoNVRSK"
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))        # numeric Telegram user id
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-URL_CONDITIONS = os.getenv("URL_CONDITIONS", "").strip()
-URL_ORDER = os.getenv("URL_ORDER", "").strip()
+URL_CONDITIONS = os.getenv("URL_CONDITIONS", "").strip()  # ссылка на пост "Условия покупки"
+URL_ORDER = os.getenv("URL_ORDER", "").strip()            # ссылка/бот/форма "Оформить заказ"
 
-if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_ID:
-    raise RuntimeError("Заполни BOT_TOKEN, CHANNEL_ID, ADMIN_ID в Railway Variables.")
-if not DATABASE_URL:
-    raise RuntimeError("Нет DATABASE_URL (Railway Postgres должен быть подключён).")
-if not URL_CONDITIONS or not URL_ORDER:
-    raise RuntimeError("Заполни URL_CONDITIONS и URL_ORDER в Railway Variables.")
-
-# Всегда по Москве
+# МСК
 MSK = timezone(timedelta(hours=3))
 
-# Невидимый символ, который Telegram принимает как текст
-INVISIBLE = "\u2060"
+# 2 поста ежедневно по МСК
+SLOT_1 = dtime(hour=11, minute=50)
+SLOT_2 = dtime(hour=12, minute=50)
 
-# ============ STATES ============
+if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_ID or not DATABASE_URL:
+    raise RuntimeError("Заполни BOT_TOKEN, CHANNEL_ID, ADMIN_ID, DATABASE_URL в переменных окружения.")
+if not URL_CONDITIONS or not URL_ORDER:
+    raise RuntimeError("Заполни URL_CONDITIONS и URL_ORDER в переменных окружения.")
+
+# ====== STATES ======
 WAIT_PHOTOS, WAIT_TEXT, WAIT_PRICE, WAIT_CONFIRM = range(4)
 MAX_PHOTOS = 10
+
+# “Пустое” сообщение под кнопки (чтобы НЕ было текста “быстрые действия”)
+INVISIBLE = "\u2060"  # word-joiner (у тебя уже рабочий вариант)
 
 @dataclass
 class Draft:
@@ -59,21 +60,10 @@ class Draft:
 drafts: Dict[int, Draft] = {}  # key = admin user id
 
 
-# ============ HELP ============
-HELP_TEXT = (
-    "Команды бота:\n"
-    "/newpost — собрать пост (фото → текст → цена)\n"
-    "/publish — опубликовать текущий черновик сразу\n"
-    "/schedule — поставить текущий черновик в ближайший слот (11:50 / 12:50 МСК)\n"
-    "/queue — показать очередь отложенных\n"
-    "/unschedule <id> — удалить отложенный пост по ID\n"
-    "/cancel — отменить текущую сборку\n"
-    "/help — подсказка\n\n"
-    "Публикации идут строго по МСК, независимо от твоего региона."
-)
+def now_msk() -> datetime:
+    return datetime.now(MSK)
 
 
-# ============ UTILS ============
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
@@ -88,77 +78,75 @@ def build_keyboard() -> InlineKeyboardMarkup:
 
 
 def render_caption(d: Draft) -> str:
-    # caption у фото ограничен ~1024 символами
+    # caption у первого фото ограничен ~1024 символами
     parts = []
     if d.text.strip():
         parts.append(d.text.strip())
-    if str(d.price).strip():
-        parts.append(f"💰 {str(d.price).strip()} ₽")
-    return "\n\n".join(parts).strip()
+    if d.price.strip():
+        parts.append(f"\n💰 {d.price.strip()} ₽")
+    return "\n".join(parts).strip()
 
 
-def now_msk() -> datetime:
-    return datetime.now(MSK)
-
-
-def next_slot_msk(dt: datetime) -> datetime:
-    """
-    Берём ближайший слот 11:50 или 12:50 по МСК.
-    Если оба прошли — завтра 11:50.
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=MSK)
-
-    slots = [(11, 50), (12, 50)]
-    today = dt.date()
-
-    for h, m in slots:
-        t = datetime(today.year, today.month, today.day, h, m, tzinfo=MSK)
-        if t > dt:
-            return t
-
-    tomorrow = today + timedelta(days=1)
-    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 11, 50, tzinfo=MSK)
-
-
-async def get_pool(app: Application) -> asyncpg.Pool:
-    pool = app.bot_data.get("db_pool")
-    if not pool:
-        raise RuntimeError("DB pool not initialized")
-    return pool
-
-
-async def init_db(app: Application) -> None:
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    app.bot_data["db_pool"] = pool
-
-    async with pool.acquire() as conn:
+async def init_db() -> None:
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id SERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
                 photo_ids TEXT[] NOT NULL,
                 text TEXT NOT NULL,
                 price TEXT NOT NULL,
-                publish_time TIMESTAMP NOT NULL,
-                published BOOLEAN DEFAULT FALSE
+                publish_time TIMESTAMPTZ NOT NULL,
+                published BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+    finally:
+        await conn.close()
 
-    log.info("DB initialized")
+
+def parse_hhmm(s: str) -> Optional[dtime]:
+    s = s.strip()
+    if len(s) != 5 or s[2] != ":":
+        return None
+    hh, mm = s.split(":")
+    if not (hh.isdigit() and mm.isdigit()):
+        return None
+    h = int(hh); m = int(mm)
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return dtime(hour=h, minute=m)
+    return None
 
 
-async def close_db(app: Application) -> None:
-    pool: Optional[asyncpg.Pool] = app.bot_data.get("db_pool")
-    if pool:
-        await pool.close()
-        log.info("DB closed")
+def next_slot_time(prefer: Optional[dtime] = None) -> datetime:
+    """
+    Возвращает ближайшее подходящее время публикации по МСК:
+    - по умолчанию: ближайшее из 11:50/12:50
+    - если prefer задан (например 11:50) — ближайший день, когда это время ещё впереди
+    """
+    n = now_msk()
+    today = n.date()
+
+    slots = [SLOT_1, SLOT_2]
+    if prefer is not None:
+        slots = [prefer]
+
+    for sl in slots:
+        candidate = datetime.combine(today, sl, tzinfo=MSK)
+        if candidate > n:
+            return candidate
+
+    # если сегодня уже поздно — завтра
+    tomorrow = today + timedelta(days=1)
+    return datetime.combine(tomorrow, slots[0], tzinfo=MSK)
 
 
 async def publish_to_channel(app: Application, d: Draft) -> None:
     caption = render_caption(d)
 
     media = []
-    for i, fid in enumerate(d.photo_file_ids[:MAX_PHOTOS]):
+    for i, fid in enumerate(d.photo_file_ids):
         if i == 0:
             media.append(InputMediaPhoto(media=fid, caption=caption))
         else:
@@ -166,7 +154,7 @@ async def publish_to_channel(app: Application, d: Draft) -> None:
 
     # 1) Альбом
     await app.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
-    # 2) Сообщение-пустышка с кнопками (без “быстрые действия”)
+    # 2) Пустышка с кнопками
     await app.bot.send_message(
         chat_id=CHANNEL_ID,
         text=INVISIBLE,
@@ -174,20 +162,70 @@ async def publish_to_channel(app: Application, d: Draft) -> None:
     )
 
 
-# ============ COMMANDS ============
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def worker_check_scheduled(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Фоновая проверка БД и публикация постов по расписанию.
+    """
+    app = context.application
+    n = now_msk()
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("""
+            SELECT id, photo_ids, text, price
+            FROM scheduled_posts
+            WHERE published = FALSE AND publish_time <= $1
+            ORDER BY publish_time ASC
+            LIMIT 5;
+        """, n)
+
+        for r in rows:
+            post_id = r["id"]
+            d = Draft(photo_file_ids=list(r["photo_ids"]), text=r["text"], price=r["price"])
+
+            try:
+                await publish_to_channel(app, d)
+                await conn.execute("UPDATE scheduled_posts SET published=TRUE WHERE id=$1;", post_id)
+                log.info("Scheduled post %s published", post_id)
+            except Exception:
+                log.exception("Failed to publish scheduled post id=%s", post_id)
+
+    finally:
+        await conn.close()
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
-    await update.message.reply_text("Я готов ✅\n\n" + HELP_TEXT)
+    await update.message.reply_text(
+        "Я готов ✅\n\n"
+        "Команды:\n"
+        "/newpost — собрать новый пост\n"
+        "/help — подсказка\n"
+    )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(
+        "Подсказка команд 👇\n\n"
+        "🧩 Создать пост:\n"
+        "• /newpost\n"
+        "• отправь фото (до 10)\n"
+        "• /done\n"
+        "• отправь текст\n"
+        "• отправь цену числом\n\n"
+        "📌 Дальше:\n"
+        "• /publish — опубликовать сейчас\n"
+        "• /schedule — поставить в ближайшее окно (11:50 или 12:50 МСК)\n"
+        "• /schedule 11:50 — выбрать время явно\n"
+        "• /cancel — отменить и очистить черновик"
+    )
 
 
-# ============ NEWPOST FLOW ============
+# ====== Conversation flow ======
+
 async def newpost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
@@ -197,7 +235,7 @@ async def newpost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Ок, собираем новый пост.\n"
         "1) Отправь фото (до 10).\n"
         "Когда закончишь — напиши /done\n"
-        "Отмена: /cancel"
+        "Отмена в любой момент: /cancel"
     )
     return WAIT_PHOTOS
 
@@ -233,7 +271,7 @@ async def done_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Нужно хотя бы 1 фото. Пришли фото.")
         return WAIT_PHOTOS
 
-    await update.message.reply_text("2) Теперь пришли текст описания.")
+    await update.message.reply_text("2) Теперь пришли текст описания (можно с эмодзи).")
     return WAIT_TEXT
 
 
@@ -271,8 +309,9 @@ async def collect_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     d.price = raw
 
-    # превью админу
+    # Превью администратору
     caption = render_caption(d)
+
     media = []
     for i, fid in enumerate(d.photo_file_ids):
         if i == 0:
@@ -282,112 +321,77 @@ async def collect_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     await update.message.reply_text("Показываю превью 👇")
     await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
-    await context.bot.send_message(chat_id=ADMIN_ID, text=INVISIBLE, reply_markup=build_keyboard())
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=INVISIBLE,
+        reply_markup=build_keyboard()
+    )
 
     await update.message.reply_text(
-        "Готово. Что дальше?\n"
-        "/publish — опубликовать сейчас\n"
-        "/schedule — в ближайший слот (11:50/12:50 МСК)\n"
-        "/cancel — отмена"
+        "Что делаем дальше?\n"
+        "• /publish — опубликовать сейчас\n"
+        "• /schedule — поставить на ближайшее время (11:50/12:50 МСК)\n"
+        "• /schedule 11:50 — выбрать время явно\n"
+        "• /cancel — отменить"
     )
     return WAIT_CONFIRM
 
 
-async def publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
 
     d = drafts.get(ADMIN_ID)
     if not d or not d.photo_file_ids or not d.text or not d.price:
-        await update.message.reply_text("Не вижу полного черновика. Начни: /newpost")
+        await update.message.reply_text("Не вижу полного черновика. Начни заново: /newpost")
         return ConversationHandler.END
 
-    app: Application = context.application
-    await publish_to_channel(app, d)
+    await publish_to_channel(context.application, d)
 
     drafts.pop(ADMIN_ID, None)
-    await update.message.reply_text("✅ Опубликовано в канале.")
+    await update.message.reply_text("Готово ✅ Опубликовано в канале.")
     return ConversationHandler.END
 
 
-async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /schedule            -> ближайшее окно 11:50/12:50 МСК
+    /schedule 11:50      -> ближайший день/время
+    """
     if not is_admin(update):
         return ConversationHandler.END
 
     d = drafts.get(ADMIN_ID)
     if not d or not d.photo_file_ids or not d.text or not d.price:
-        await update.message.reply_text("Не вижу полного черновика. Начни: /newpost")
+        await update.message.reply_text("Сначала собери пост: /newpost")
         return ConversationHandler.END
 
-    slot = next_slot_msk(now_msk())
+    prefer = None
+    if context.args:
+        t = parse_hhmm(" ".join(context.args))
+        if not t:
+            await update.message.reply_text("Формат времени: /schedule 11:50 (только HH:MM)")
+            return WAIT_CONFIRM
+        prefer = t
 
-    pool = await get_pool(context.application)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO scheduled_posts (photo_ids, text, price, publish_time, published)
-            VALUES ($1, $2, $3, $4, FALSE)
-            """,
-            d.photo_file_ids,
-            d.text,
-            str(d.price),
-            slot.replace(tzinfo=None)  # храним как МСК без tz
-        )
+    publish_time = next_slot_time(prefer)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
+            INSERT INTO scheduled_posts (admin_id, photo_ids, text, price, publish_time, published)
+            VALUES ($1, $2, $3, $4, $5, FALSE);
+        """, ADMIN_ID, d.photo_file_ids, d.text, d.price, publish_time)
+    finally:
+        await conn.close()
 
     drafts.pop(ADMIN_ID, None)
-    await update.message.reply_text(f"✅ Поставил в очередь на {slot.strftime('%d.%m %H:%M')} (МСК).")
+
+    await update.message.reply_text(
+        f"Ок ✅ Поставил в очередь на {publish_time.strftime('%d.%m %H:%M')} (МСК).\n"
+        "Если нужно собрать ещё — /newpost"
+    )
     return ConversationHandler.END
-
-
-async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    pool = await get_pool(context.application)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, publish_time, price, left(text, 40) AS t
-            FROM scheduled_posts
-            WHERE published = FALSE
-            ORDER BY publish_time ASC
-            LIMIT 20
-            """
-        )
-
-    if not rows:
-        await update.message.reply_text("Очередь пустая ✅")
-        return
-
-    lines = ["Очередь (МСК):"]
-    for r in rows:
-        pt: datetime = r["publish_time"]  # считаем что это МСК
-        lines.append(f"#{r['id']} — {pt.strftime('%d.%m %H:%M')} — {r['price']} ₽ — {r['t']}…")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Используй: /unschedule 123")
-        return
-
-    post_id = int(context.args[0])
-
-    pool = await get_pool(context.application)
-    async with pool.acquire() as conn:
-        res = await conn.execute(
-            "DELETE FROM scheduled_posts WHERE id=$1 AND published=FALSE",
-            post_id
-        )
-
-    # res выглядит как "DELETE 1" или "DELETE 0"
-    if res.endswith("1"):
-        await update.message.reply_text(f"Удалил отложенный пост #{post_id} ✅")
-    else:
-        await update.message.reply_text(f"Не нашёл пост #{post_id} (возможно уже опубликован/удалён).")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -397,92 +401,64 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ============ AUTOPUBLISH JOB ============
-async def autopublish_job(context: ContextTypes.DEFAULT_TYPE):
-    app: Application = context.application
-    pool = await get_pool(app)
-
-    now_naive = now_msk().replace(tzinfo=None)
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, photo_ids, text, price
-            FROM scheduled_posts
-            WHERE published = FALSE AND publish_time <= $1
-            ORDER BY publish_time ASC
-            LIMIT 1
-            """,
-            now_naive
-        )
-
-        if not row:
-            return
-
-        post_id = row["id"]
-        d = Draft(
-            photo_file_ids=list(row["photo_ids"]),
-            text=row["text"],
-            price=row["price"]
-        )
-
-        # публикуем
-        await publish_to_channel(app, d)
-
-        # помечаем опубликованным
-        await conn.execute("UPDATE scheduled_posts SET published=TRUE WHERE id=$1", post_id)
-        log.info("Autopublished scheduled post id=%s", post_id)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error: %s", context.error)
+    # админский мягкий фидбек (чтобы не молчало)
+    try:
+        if update and isinstance(update, Update) and update.effective_user and update.effective_user.id == ADMIN_ID:
+            if update.message:
+                await update.message.reply_text("⚠️ Ошибка на стороне бота. Я записал лог. Попробуй ещё раз.")
+    except Exception:
+        pass
 
 
-# ============ APP LIFECYCLE ============
 async def post_init(app: Application) -> None:
-    await init_db(app)
-    # каждые 25 секунд проверяем очередь
-    app.job_queue.run_repeating(autopublish_job, interval=25, first=10)
-    log.info("Autopublish job scheduled")
-
-
-async def post_shutdown(app: Application) -> None:
-    await close_db(app)
+    # создаём таблицу
+    await init_db()
+    # запускаем фоновую проверку каждые 20 секунд
+    app.job_queue.run_repeating(worker_check_scheduled, interval=20, first=5)
+    log.info("DB ready, scheduler started")
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    # Команды
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("queue", queue))
-    app.add_handler(CommandHandler("unschedule", unschedule))
-
-    # Диалог сборки поста
     conv = ConversationHandler(
         entry_points=[CommandHandler("newpost", newpost)],
         states={
             WAIT_PHOTOS: [
                 MessageHandler(filters.PHOTO, collect_photos),
                 CommandHandler("done", done_photos),
-                CommandHandler("cancel", cancel),
             ],
             WAIT_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, collect_text),
-                CommandHandler("cancel", cancel),
             ],
             WAIT_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, collect_price),
-                CommandHandler("cancel", cancel),
             ],
             WAIT_CONFIRM: [
-                CommandHandler("publish", publish_now),
-                CommandHandler("schedule", schedule),
-                CommandHandler("cancel", cancel),
+                CommandHandler("publish", publish),
+                CommandHandler("schedule", schedule_cmd),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("commands", cmd_help))
+
     app.add_handler(conv)
+    app.add_handler(CommandHandler("publish", publish))
+    app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
+
+    app.add_error_handler(on_error)
 
     log.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
