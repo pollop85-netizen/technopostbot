@@ -1,4 +1,8 @@
 import os
+import asyncio
+import asyncpg
+from datetime import datetime, timezone, timedelta
+import os
 import logging
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
@@ -26,6 +30,9 @@ log = logging.getLogger("technopostbot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # можно "@TechnoNVRSK"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))         # твой numeric Telegram user id
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+MSK = timezone(timedelta(hours=3))
 
 # ссылки для кнопок
 URL_CONDITIONS = os.getenv("URL_CONDITIONS", "").strip()  # ссылка на пост "Условия покупки"
@@ -221,6 +228,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Ок, отменил. Черновик очищен.")
     return ConversationHandler.END
 
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id SERIAL PRIMARY KEY,
+            photo_ids TEXT[],
+            text TEXT,
+            price TEXT,
+            publish_time TIMESTAMP,
+            published BOOLEAN DEFAULT FALSE
+        );
+    """)
+    await conn.close()
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
@@ -249,6 +269,14 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cancel))
 
     log.info("Bot started")
+    async def main():
+    await init_db()
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await application.updater.idle()
+
+asyncio.run(main())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
